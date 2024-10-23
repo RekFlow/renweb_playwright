@@ -1,12 +1,11 @@
+import json
 import logging
 import os
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.sync_api import Page
-from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 # Load environment variables from .env file
@@ -19,165 +18,327 @@ logging.basicConfig(
     handlers=[logging.FileHandler("scraper.log"), logging.StreamHandler()],
 )
 
+# Global credentials and URLs
+USERNAME = os.getenv("NCS_USERNAME")
+PASSWORD = os.getenv("NCS_PASSWORD")
+DISTRICT_CODE = os.getenv("DISTRICT_CODE")
+LOGIN_URL = f"https://schoolsitefp.renweb.com/?districtCode={DISTRICT_CODE}&schoolCode="
 
-class GradeScraperException(Exception):
-    """Custom exception for grade scraping errors"""
+# Create output directory for debug files
+DEBUG_DIR = Path("debug_output")
+DEBUG_DIR.mkdir(exist_ok=True)
 
-    pass
+
+def save_debug_file(content, filename, is_binary=False):
+    """Save debug content to file with timestamp"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = DEBUG_DIR / f"{filename}_{timestamp}"
+    if is_binary:
+        filepath = filepath.with_suffix(".png")
+        with open(filepath, "wb") as f:
+            f.write(content)
+    else:
+        filepath = filepath.with_suffix(".html")
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+    logging.info(f"Saved debug file: {filepath}")
 
 
-class RenWebScraper:
-    def __init__(self):
-        self.username = os.getenv("NCS_USERNAME")
-        self.password = os.getenv("NCS_PASSWORD")
-        self.district_code = os.getenv("DISTRICT_CODE")
-        self.base_url = f"https://schoolsitefp.renweb.com/?districtCode={self.district_code}&schoolCode="
-        self.logged_in = False
+def save_data(data, filename):
+    """Save scraped data to a JSON file with timestamp"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = DEBUG_DIR / f"{filename}_{timestamp}.json"
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    logging.info(f"Data saved to {filepath}")
 
-    def login(self, page: Page) -> None:
-        """Handle the login process"""
+
+def extract_grades_from_iframe(frame):
+    """Extract grade information from an iframe"""
+    try:
+        # Wait for page content
+        frame.wait_for_selector("body", state="attached", timeout=30000)
+
+        # Save frame content for debugging
+        frame_content = frame.content()
+        save_debug_file(frame_content, "frame_content_debug")
+
+        # Get basic course info if available
+        course_info = {"course_name": "", "teacher_name": "", "term": ""}
         try:
-            logging.info("Initiating login process...")
-            page.goto(self.base_url)
-
-            # Wait for and click initial login button
-            page.wait_for_selector("button.schoolsite-popup-button", timeout=30000)
-            with page.expect_popup() as popup_info:
-                page.click("button.schoolsite-popup-button")
-
-            # Handle login popup
-            popup_page = popup_info.value
-            popup_page.wait_for_load_state("networkidle")
-
-            # Fill login form
-            popup_page.fill("input[id='rw-district-code']", self.district_code)
-            popup_page.fill("input[id='rw-username']", self.username)
-            popup_page.fill("input[id='rw-password']", self.password)
-
-            # Submit login
-            popup_page.click("input[id='next']")
-            popup_page.wait_for_load_state("networkidle")
-
-            # Verify login success
-            if "familyportal.renweb.com/en-us/school/index" in popup_page.url:
-                self.logged_in = True
-                logging.info("Login successful")
-                return popup_page
-            else:
-                raise GradeScraperException("Login failed - unexpected redirect URL")
-
-        except PlaywrightTimeout as e:
-            logging.error(f"Timeout during login: {str(e)}")
-            raise GradeScraperException(f"Login process timed out: {str(e)}")
+            header_text = frame.locator("body").first.inner_text().split("\n")[0:3]
+            course_info = {
+                "course_name": header_text[0] if len(header_text) > 0 else "",
+                "teacher_name": header_text[1] if len(header_text) > 1 else "",
+                "term": header_text[2] if len(header_text) > 2 else "",
+            }
         except Exception as e:
-            logging.error(f"Unexpected error during login: {str(e)}")
-            raise GradeScraperException(f"Login failed: {str(e)}")
+            logging.error(f"Error extracting course info: {str(e)}")
 
-    def navigate_to_grades(self, page: Page) -> None:
-        """Navigate to the grades section"""
-        try:
-            logging.info("Navigating to grades page...")
+        grades_data = {"course_info": course_info, "categories": {}, "term_grade": None}
 
-            # Wait for and click the grades navigation link
-            page.wait_for_selector("a[href*='grades']", timeout=30000)
-            page.click("a[href*='grades']")
+        current_category = None
 
-            # Wait for grades content to load
-            page.wait_for_selector(".grades-container", timeout=30000)
-            logging.info("Successfully navigated to grades page")
+        # Get all tables
+        tables = frame.locator("table").all()
 
-        except PlaywrightTimeout as e:
-            logging.error(f"Timeout while navigating to grades: {str(e)}")
-            raise GradeScraperException("Failed to navigate to grades page")
-        except Exception as e:
-            logging.error(f"Error navigating to grades: {str(e)}")
-            raise GradeScraperException(f"Navigation failed: {str(e)}")
+        for table in tables:
+            try:
+                table_text = table.inner_text().strip().lower()
 
-    def extract_grades(self, page: Page) -> List[Dict]:
-        """Extract grades data from the page"""
-        try:
-            logging.info("Extracting grades data...")
+                # Check if this is a category header
+                if any(
+                    cat in table_text
+                    for cat in ["classwork", "homework", "projects", "quizzes", "tests"]
+                ):
+                    current_category = table_text.split()[-1].strip()
+                    grades_data["categories"][current_category] = {
+                        "assignments": [],
+                        "category_average": None,
+                    }
+                    continue
 
-            # Wait for the grades table to be visible
-            page.wait_for_selector("table.grades-table", timeout=30000)
+                # Get headers
+                headers = [
+                    cell.inner_text().strip().lower()
+                    for cell in table.locator("th,td").first.all()
+                ]
 
-            # Extract grades data using JavaScript evaluation
-            grades_data = page.evaluate(
-                """
-                () => {
-                    const rows = Array.from(document.querySelectorAll('table.grades-table tr'));
-                    return rows.slice(1).map(row => {
-                        const cells = Array.from(row.querySelectorAll('td'));
-                        return {
-                            subject: cells[0]?.textContent?.trim(),
-                            current_grade: cells[1]?.textContent?.trim(),
-                            letter_grade: cells[2]?.textContent?.trim(),
-                            last_updated: cells[3]?.textContent?.trim()
-                        };
-                    });
-                }
-            """
-            )
+                # If this looks like an assignment table
+                if "assignment" in headers:
+                    rows = table.locator("tr").all()
 
-            logging.info(f"Successfully extracted {len(grades_data)} grade entries")
-            return grades_data
+                    for row in rows[1:]:  # Skip header row
+                        cells = row.locator("td").all()
+                        cell_texts = [cell.inner_text().strip() for cell in cells]
 
-        except PlaywrightTimeout as e:
-            logging.error(f"Timeout while extracting grades: {str(e)}")
-            raise GradeScraperException("Failed to extract grades data")
-        except Exception as e:
-            logging.error(f"Error extracting grades: {str(e)}")
-            raise GradeScraperException(f"Grade extraction failed: {str(e)}")
+                        # Skip empty rows
+                        if not any(cell_texts):
+                            continue
 
-    def save_grades(self, grades_data: List[Dict]) -> None:
-        """Save grades data to a file"""
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"grades_{timestamp}.json"
+                        # Check if this is a category average row
+                        if "category average" in cell_texts[0].lower():
+                            if current_category and len(cell_texts) > 1:
+                                grades_data["categories"][current_category][
+                                    "category_average"
+                                ] = cell_texts[1]
+                            continue
 
-            import json
+                        # Check if this is the term grade
+                        if "term grade" in cell_texts[0].lower():
+                            if len(cell_texts) > 2:
+                                grades_data["term_grade"] = {
+                                    "score": cell_texts[1],
+                                    "letter": (
+                                        cell_texts[2] if len(cell_texts) > 2 else ""
+                                    ),
+                                }
+                            continue
 
-            with open(filename, "w") as f:
-                json.dump(grades_data, f, indent=4)
+                        # Regular assignment row
+                        if current_category and len(cell_texts) >= 5:
+                            assignment = {
+                                "name": cell_texts[0],
+                                "points": cell_texts[1],
+                                "max_points": cell_texts[2],
+                                "percentage": (
+                                    str(
+                                        round(
+                                            float(cell_texts[1])
+                                            / float(cell_texts[2])
+                                            * 100,
+                                            2,
+                                        )
+                                    )
+                                    if cell_texts[1] and cell_texts[2]
+                                    else None
+                                ),
+                                "status": cell_texts[4],
+                                "due_date": (
+                                    cell_texts[5] if len(cell_texts) > 5 else None
+                                ),
+                            }
+                            grades_data["categories"][current_category][
+                                "assignments"
+                            ].append(assignment)
 
-            logging.info(f"Grades data saved to {filename}")
+            except Exception as e:
+                logging.error(f"Error processing table: {str(e)}")
+                continue
 
-        except Exception as e:
-            logging.error(f"Error saving grades data: {str(e)}")
-            raise GradeScraperException(f"Failed to save grades data: {str(e)}")
+        return (
+            grades_data
+            if grades_data["categories"] or grades_data["term_grade"]
+            else None
+        )
 
-    def run(self) -> Optional[List[Dict]]:
-        """Main execution method"""
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False)
-                page = browser.new_page()
+    except Exception as e:
+        logging.error(f"Error extracting grades from iframe: {str(e)}")
+        return None
 
-                # Execute scraping process
-                logged_in_page = self.login(page)
-                self.navigate_to_grades(logged_in_page)
-                grades_data = self.extract_grades(logged_in_page)
-                self.save_grades(grades_data)
 
-                browser.close()
-                return grades_data
+def scrape_grades(page):
+    """Navigate to and scrape grades data"""
+    try:
+        # Navigate directly to grades page
+        base_url = page.url.split("/en-us")[0]
+        grades_url = f"{base_url}/en-us/student/grades"
 
-        except GradeScraperException as e:
-            logging.error(f"Scraping failed: {str(e)}")
-            return None
-        except Exception as e:
-            logging.error(f"Unexpected error: {str(e)}")
-            return None
+        logging.info(f"Navigating to grades URL: {grades_url}")
+        page.goto(grades_url)
+
+        # Wait for page and frames to load
+        page.wait_for_load_state("networkidle")
+        time.sleep(10)
+
+        # Save initial page state
+        save_debug_file(page.content(), "initial_grades_page")
+        screenshot_bytes = page.screenshot(full_page=True)
+        save_debug_file(screenshot_bytes, "initial_grades_page", is_binary=True)
+
+        # Get all frames
+        frames = page.frames
+        all_courses_data = []
+
+        for frame in frames:
+            try:
+                if frame.url and (
+                    "grades.cfm" in frame.url.lower() or "/GradeBook/" in frame.url
+                ):
+                    logging.info(f"Processing grades frame: {frame.url}")
+                    frame_data = extract_grades_from_iframe(frame)
+                    if frame_data:
+                        all_courses_data.append(frame_data)
+            except Exception as e:
+                logging.error(f"Error processing frame: {str(e)}")
+
+        return all_courses_data if all_courses_data else None
+
+    except Exception as e:
+        logging.error(f"Error in scrape_grades: {str(e)}")
+        return None
+
+
+def perform_login(page):
+    """Handle the login process"""
+    try:
+        # Navigate to login page
+        logging.info("Navigating to login page...")
+        page.goto(LOGIN_URL)
+
+        # Wait for and click initial login button
+        logging.info("Waiting for initial login button...")
+        page.wait_for_selector("button.schoolsite-popup-button", timeout=30000)
+
+        with page.expect_popup() as popup_info:
+            page.locator("button.schoolsite-popup-button").click()
+
+        # Handle login popup
+        popup_page = popup_info.value
+        popup_page.wait_for_load_state("networkidle")
+
+        # Fill login form
+        logging.info("Filling login form...")
+        popup_page.fill("input[id='rw-district-code']", DISTRICT_CODE)
+        popup_page.fill("input[id='rw-username']", USERNAME)
+        popup_page.fill("input[id='rw-password']", PASSWORD)
+
+        # Submit login form
+        logging.info("Submitting login form...")
+        popup_page.wait_for_selector("input[id='next']", state="visible", timeout=60000)
+        popup_page.locator("input[id='next']").click()
+
+        # Wait for login process
+        time.sleep(5)
+
+        return popup_page
+
+    except Exception as e:
+        logging.error(f"Login error: {str(e)}")
+        return None
 
 
 def main():
-    scraper = RenWebScraper()
-    grades = scraper.run()
+    """Main function to run the scraper"""
+    if not all([USERNAME, PASSWORD, DISTRICT_CODE]):
+        logging.error(
+            "Missing required environment variables. Please check your .env file."
+        )
+        return
 
-    if grades:
-        logging.info("Scraping completed successfully")
-    else:
-        logging.error("Scraping failed")
+    with sync_playwright() as p:
+        try:
+            # Launch browser with specific settings
+            browser = p.chromium.launch(headless=False, args=["--start-maximized"])
+            context = browser.new_context(viewport={"width": 1920, "height": 1080})
+            page = context.new_page()
+
+            # Perform login
+            popup_page = perform_login(page)
+            if not popup_page:
+                logging.error("Login failed")
+                return
+
+            # Check for successful login
+            current_url = popup_page.url
+            logging.info(f"Current URL after login: {current_url}")
+
+            # Determine which page has the dashboard
+            dashboard_page = None
+            if "familyportal.renweb.com" in current_url:
+                logging.info("Dashboard loaded in popup page")
+                dashboard_page = popup_page
+            else:
+                logging.info("Checking parent page for dashboard...")
+                popup_page.close()
+
+                page.wait_for_load_state("networkidle", timeout=10000)
+                if "familyportal.renweb.com" in page.url:
+                    logging.info("Dashboard loaded in parent page")
+                    dashboard_page = page
+                else:
+                    logging.error("Failed to find dashboard")
+                    return
+
+            # Scrape grades
+            if dashboard_page:
+                logging.info("Starting grades extraction...")
+                grades_data = scrape_grades(dashboard_page)
+
+                if grades_data:
+                    data = {
+                        "school_info": {
+                            "name": dashboard_page.locator(
+                                "#facts-school-name-span"
+                            ).inner_text(),
+                            "year": dashboard_page.locator(
+                                "#facts-school-year-term-span"
+                            ).inner_text(),
+                        },
+                        "courses": grades_data,
+                        "debug": {
+                            "url": dashboard_page.url,
+                            "timestamp": datetime.now().isoformat(),
+                        },
+                    }
+                    save_data(data, "grades_data")
+                    logging.info("Successfully extracted grades data")
+                else:
+                    logging.error("No grades data found")
+
+                # Save final page state
+                final_screenshot = dashboard_page.screenshot(full_page=True)
+                save_debug_file(final_screenshot, "final_state", is_binary=True)
+
+        except Exception as e:
+            logging.error(f"An error occurred: {str(e)}")
+            if "page" in locals():
+                error_screenshot = page.screenshot()
+                save_debug_file(error_screenshot, "error_screenshot", is_binary=True)
+
+        finally:
+            if "browser" in locals():
+                browser.close()
 
 
 if __name__ == "__main__":
