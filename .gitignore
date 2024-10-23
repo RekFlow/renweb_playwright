@@ -39,6 +39,7 @@ ENV/
 *.log
 dashboard_loaded_parent.png
 page_loaded.png
+debug_output/    # Add this line here
 
 # Output files
 *.json
